@@ -1,0 +1,4 @@
+.venv
+.env
+chat-ui/node_modules
+__pycache__
