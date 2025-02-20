@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/select';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Send } from 'lucide-react';
+import { API_URL } from '@/lib/utils';
 
 const Home = () => {
   const [message, setMessage] = useState('');
@@ -26,7 +27,7 @@ const Home = () => {
 
   const fetchAssistants = async () => {
     try {
-      const response = await fetch('http://localhost:8000/assistants/');
+      const response = await fetch(`${API_URL}/assistants/`);
       const data = await response.json();
       setAssistants(data.assistants);
     } catch (error) {
@@ -46,7 +47,7 @@ const Home = () => {
     setConversations(prev => [...prev, newMessage]);
 
     try {
-      const response = await fetch('http://localhost:8000/chat/', {
+      const response = await fetch(`${API_URL}/chat/`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
