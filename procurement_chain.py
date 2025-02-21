@@ -1,441 +1,260 @@
-import json
+# procurement_chain.py
 import os
-import re
-from enum import Enum
+import logging
 from dataclasses import dataclass
 from typing import Dict, Optional, List
-import logging
+import asyncio
 
-# For environment vars
 from dotenv import load_dotenv
 
-# LangChain / OpenAI-based imports (update as needed)
 from langchain.chat_models import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableMap, RunnablePassthrough
 
-###############################################################################
-#  ENV & SETUP
-###############################################################################
-load_dotenv()  # Make sure you have OPENAI_API_KEY in your .env
+load_dotenv()
 
-# Enums for standardized options
-class ProcurementAmount(Enum):
-    UNDER_10K = "Under $10,000"
-    BETWEEN_10K_15K = "$10,000-$15,000"
-    BETWEEN_15K_200K = "$15,000-$200,000"
-    OVER_200K = "Over $200,000"
-
-class ExistingArrangement(Enum):
-    NONE = "No existing arrangement"
-    PANEL = "Panel arrangement"
-    STANDING_OFFER = "Standing offer"
-    WHOLE_OF_GOVERNMENT = "Whole of government arrangement"
-
-class ProcurementCategory(Enum):
-    CONSULTANCY = "Consultancy services"
-    IT_SERVICES = "IT services"
-    PROFESSIONAL_SERVICES = "Professional services"
-    FACILITY_SERVICES = "Facility services"
-    TRAINING = "Training services"
-    OTHER = "Other services"
-
-class WorkComplexity(Enum):
-    LOW = "Low complexity"
-    MEDIUM = "Medium complexity"
-    HIGH = "High complexity"
-    VERY_HIGH = "Very high complexity"
-
-# Dataclass representing a single slot (or question) in the workflow
+# -----------------------
+# Decision Tree Data Model
+# -----------------------
 @dataclass
-class ProcurementSlot:
-    name: str
-    prompt: str
-    validation: List[str]
-    required: bool = True
+class DecisionOption:
+    option: str
+    answer: Optional[str] = None         # Terminal answer (if branch ends)
+    next_node: Optional[str] = None        # Pointer to the next decision node
 
-###############################################################################
-#  PROCUREMENT WORKFLOW
-###############################################################################
+@dataclass
+class DecisionNode:
+    name: str
+    question: str
+    options: List[DecisionOption]
+
+# -----------------------
+# Procurement Workflow with AI Extraction, Greetings, and Farewells
+# -----------------------
 class ProcurementWorkflow:
     def __init__(self):
+        # Build the decision tree
+        self.decision_tree: Dict[str, DecisionNode] = self._initialize_decision_tree()
+        # Session data: track current node, answers, and conversation history per user
+        self.sessions: Dict[str, Dict] = {}
+        
+        # Setup the AI LLM (for extraction)
         self.llm = ChatOpenAI(
             model_name="gpt-4",
             temperature=0.3,
             openai_api_key=os.getenv("OPENAI_API_KEY"),
             verbose=True
         )
-        # Dictionary to track user sessions, storing:
-        #   - "data": a dict with answered slots
-        #   - "history": a list with conversation messages
-        self.sessions: Dict[str, Dict] = {}
-        # New dictionary to store final results for each user
-        self.final_results: Dict[str, Dict] = {}
-
-        # Define each workflow slot
-        self.slots = self._initialize_slots()
-
-        # Setup all the LLM prompt chains (validation, analysis, recommendation, extraction)
-        self._setup_chains()
-
-    def _initialize_slots(self) -> Dict[str, ProcurementSlot]:
-        return {
-            "po_reference": ProcurementSlot(
-                name="po_reference",
-                prompt="Please provide the PO reference number:",
-                validation=[]  # no specific set of valid values
-            ),
-            "service_standard": ProcurementSlot(
-                name="service_standard",
-                prompt="Is the DSC Standard Terms and Conditions (Services) confirmed? (Yes/No)",
-                validation=["Yes", "No"]
-            ),
-            "over_the_counter": ProcurementSlot(
-                name="over_the_counter",
-                prompt="Are the services normally purchased over the counter? (Yes/No)",
-                validation=["Yes", "No"]
-            ),
-            "procurement_amount": ProcurementSlot(
-                name="procurement_amount",
-                prompt="What is the procurement amount? (Under $10,000, $10,000-$15,000, $15,000-$200,000, Over $200,000)",
-                validation=[e.value for e in ProcurementAmount]
-            ),
-            "existing_arrangement": ProcurementSlot(
-                name="existing_arrangement",
-                prompt="Does an existing arrangement exist for this contract? (No existing arrangement, Panel arrangement, Standing offer, Whole of government arrangement)",
-                validation=[e.value for e in ExistingArrangement]
-            ),
-            "procurement_category": ProcurementSlot(
-                name="procurement_category",
-                prompt="What category does the procurement fall within? (Consultancy services, IT services, Professional services, Facility services, Training services, Other services)",
-                validation=[e.value for e in ProcurementCategory]
-            ),
-            "work_complexity": ProcurementSlot(
-                name="work_complexity",
-                prompt="What is the complexity of the work being carried out? (Low complexity, Medium complexity, High complexity, Very high complexity)",
-                validation=[e.value for e in WorkComplexity]
-            ),
-        }
-
-    def _setup_chains(self):
-        """Setup the LLM prompt chains for validation, analysis, and recommendation."""
-        # ------------------
-        # Validation chain
-        # ------------------
-        validation_prompt = PromptTemplate(
-            template="""
-            Validate if "{input}" is acceptable for slot type "{slot_type}".
-            Valid options are: {valid_options}.
-            Return only "VALID" or "INVALID".
-            """,
-            input_variables=["input", "slot_type", "valid_options"]
-        )
-        self.validation_chain = (
-            validation_prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        # ------------------
-        # Analysis chain
-        # ------------------
-        analysis_prompt = PromptTemplate(
-            template="""
-            Analyze this procurement request:
-            PO Reference: {po_reference}
-            Service Standard: {service_standard}
-            Over the Counter: {over_the_counter}
-            Amount: {procurement_amount}
-            Existing Arrangement: {existing_arrangement}
-            Category: {procurement_category}
-            Work Complexity: {work_complexity}
-
-            Chat History:
-            {chat_history}
-
-            Provide a detailed analysis including:
-            1. Risk level and justification
-            2. Required approvals based on amount and complexity
-            3. Documentation requirements
-            4. Compliance considerations
-            5. Procurement strategy recommendations
-            """,
-            input_variables=[
-                "po_reference",
-                "service_standard",
-                "over_the_counter",
-                "procurement_amount",
-                "existing_arrangement",
-                "procurement_category",
-                "work_complexity",
-                "chat_history"
-            ]
-        )
-
-        self.analysis_chain = (
-            analysis_prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        # ------------------
-        # Recommendation chain
-        # ------------------
-        recommendation_prompt = PromptTemplate(
-            template="""
-            Based on this analysis:
-            {analysis}
-
-            Provide specific recommendations for:
-            1. Contract type and terms
-            2. Procurement timeline and key milestones
-            3. Required stakeholder engagements
-            4. Risk mitigation strategies
-            5. Next steps and action items
-
-            Format the response in a clear, actionable manner.
-            """,
-            input_variables=["analysis"]
-        )
-        self.recommendation_chain = (
-            recommendation_prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        # ------------------
-        # Combined chain (analysis -> recommendation)
-        # ------------------
-        self.full_chain = (
-            self.analysis_chain.with_config({"run_name": "analysis"})
-            | {"analysis": RunnablePassthrough()}
-            | self.recommendation_chain
-        )
-
-        # ------------------
-        # Extraction chain
-        # ------------------
+        # Build an extraction chain to process free-form input
         extraction_prompt = PromptTemplate(
             template="""
-            You are given a free-form user message that may contain answers for multiple slots in a procurement workflow. 
-            The slots and their expected answers are:
+You are given a list of options: {options}.
+User input: {input}
+Select the best matching option. Return exactly the option text from the list that best matches the user's input.
+If no option seems relevant, return "None".
+""",
+            input_variables=["options", "input"]
+        )
+        self.extraction_chain = extraction_prompt | self.llm | StrOutputParser()
 
-            1. **po_reference**: a purchase order reference number (e.g., "PO123").
-            2. **service_standard**: "Yes" or "No" for DSC Standard Terms confirmation.
-            3. **over_the_counter**: "Yes" or "No".
-            4. **procurement_amount**: one of: {procurement_amount_options}. note: user can just say 25k or 2500 or around 35k.
-            5. **existing_arrangement**: one of: {existing_arrangement_options}.
-            6. **procurement_category**: one of: {procurement_category_options}.
-            7. **work_complexity**: one of: {work_complexity_options}.
-
-            The user may mention multiple answers in a single message, e.g. "The PO number is PO123, DSC Terms are confirmed, the cost is about $30,000, and we do not have an existing arrangement."
-
-            For each slot that you find in the text, output an entry in JSON form, for example:
-            {{
-            "po_reference": "PO123",
-            "service_standard": "Yes"
-            }}
-
-            Output only a JSON object with the discovered slots. 
-            Do not include any text outside the JSON.
-
-            User message: {message}
-            """,
-            input_variables=[
-                "message",
-                "procurement_amount_options",
-                "existing_arrangement_options",
-                "procurement_category_options",
-                "work_complexity_options"
+    def _initialize_decision_tree(self) -> Dict[str, DecisionNode]:
+        tree = {}
+        # Node 1: Existing Arrangement
+        tree["existing_arrangement"] = DecisionNode(
+            name="existing_arrangement",
+            question="Does an existing arrangement exist for this contract?",
+            options=[
+                DecisionOption(option="RoPS", answer="Use a Purchase Order and reference the RoPS."),
+                DecisionOption(option="Preferred Supplier Arrangement (PSA) Name and Number",
+                               answer="Use a Purchase Order and reference the PSA name and number."),
+                DecisionOption(option="Other Council Arrangement", answer="To be drafted."),
+                DecisionOption(option="Local Buy",
+                               answer="Issue a Notice of Successful Quotation/Tender Letter and set up a Purchase Order referencing the LB arrangement name and number."),
+                DecisionOption(option="No", next_node="procurement_value")
             ]
         )
-        self.extraction_chain = (
-            extraction_prompt
-            | self.llm
-            | StrOutputParser()
+        # Node 2: Procurement Value
+        tree["procurement_value"] = DecisionNode(
+            name="procurement_value",
+            question="What is the value of the procurement?",
+            options=[
+                DecisionOption(option="Under $10,000", next_node="procurement_category"),
+                DecisionOption(option="$10,000-$15,000", next_node="procurement_category"),
+                DecisionOption(option="$15,000-$200,000", next_node="procurement_category"),
+                DecisionOption(option="Over $200,000", next_node="procurement_category")
+            ]
         )
+        # Node 3: Procurement Category
+        tree["procurement_category"] = DecisionNode(
+            name="procurement_category",
+            question="What category does the procurement fall within?",
+            options=[
+                DecisionOption(option="Construction", next_node="construction_risk"),
+                DecisionOption(option="Services Only", next_node="services_only"),
+                DecisionOption(option="Goods and Services", next_node="goods_and_services_risk"),
+                DecisionOption(option="Goods Only", answer="Use a Goods and Services Contract.")
+            ]
+        )
+        # Node 4: Construction Risk
+        tree["construction_risk"] = DecisionNode(
+            name="construction_risk",
+            question="What is the risk of the work being undertaken?",
+            options=[
+                DecisionOption(option="Low", answer="Set up a Purchase Order referencing the DSC Standard Terms and Conditions (Services) on the website."),
+                DecisionOption(option="Medium", next_node="construction_scope")
+            ]
+        )
+        # Node 5: Construction Scope
+        tree["construction_scope"] = DecisionNode(
+            name="construction_scope",
+            question="What does the scope entail?",
+            options=[
+                DecisionOption(option="Supply of equipment, building elements, etc. and/or Installation",
+                               answer="Use a Supply and Install Contract."),
+                DecisionOption(option="Construction work only", next_node="construction_complexity")
+            ]
+        )
+        # Node 6: Construction Complexity
+        tree["construction_complexity"] = DecisionNode(
+            name="construction_complexity",
+            question="What is the complexity of the work being carried out?",
+            options=[
+                DecisionOption(option="Low", answer="Use a Construct Only AS4000."),
+                DecisionOption(option="Medium", answer="Use the Minor Works contract (with or without design – AS4902)."),
+                DecisionOption(option="High", next_node="construction_high_detail")
+            ]
+        )
+        # Node 7: Construction High Detail
+        tree["construction_high_detail"] = DecisionNode(
+            name="construction_high_detail",
+            question="Are the services for a fixed period including broad consultancy services?",
+            options=[
+                DecisionOption(option="Fixed period with Council provided design", answer="Use a Construct Only AS4000."),
+                DecisionOption(option="Fixed period with Contractor providing the design", answer="Use a Design and Construct AS4902 Contract."),
+                DecisionOption(option="Fixed period for Contractor Management services", answer="Use an AS4000 Contract."),
+                DecisionOption(option="Other consultancy services", answer="Use a Services (Single Engagement) Contract.")
+            ]
+        )
+        # Node for Services Only
+        tree["services_only"] = DecisionNode(
+            name="services_only",
+            question="Is the value within your credit card and transaction delegation?",
+            options=[
+                DecisionOption(option="Yes", next_node="services_only_over_counter"),
+                DecisionOption(option="No", answer="Set up a Purchase Order referencing the DSC Standard Terms and Conditions (Goods and Services) on the website.")
+            ]
+        )
+        tree["services_only_over_counter"] = DecisionNode(
+            name="services_only_over_counter",
+            question="Are the services normally purchased over the counter?",
+            options=[
+                DecisionOption(option="Yes", answer="Pay on Credit Card."),
+                DecisionOption(option="No", answer="Set up a Purchase Order referencing the DSC Standard Terms and Conditions (Goods and Services) on the website.")
+            ]
+        )
+        # Node for Goods and Services Risk
+        tree["goods_and_services_risk"] = DecisionNode(
+            name="goods_and_services_risk",
+            question="What is the risk of the scope of works?",
+            options=[
+                DecisionOption(option="Low", answer="Set up a Purchase Order referencing the DSC Standard Terms and Conditions (Goods and Services) on the website."),
+                DecisionOption(option="Medium", answer="Use a Goods and Services Contract."),
+                DecisionOption(option="High", answer="Use a Goods and Services Contract.")
+            ]
+        )
+        return tree
 
-    async def _extract_from_message(self, message: str) -> dict:
-        """
-        Run the extraction chain to parse user’s free-form text and return 
-        a dictionary of extracted slot values. Includes robust error handling 
-        for invocation and JSON parsing failures.
-        """
+    # -----------------------
+    # AI-based Extraction Helpers
+    # -----------------------
+    async def _extract_option_with_ai(self, user_input: str, node: DecisionNode) -> Optional[DecisionOption]:
+        options_text = ", ".join([opt.option for opt in node.options])
         try:
-            logging.debug(f"User message for extraction: {message}")
-
-            extraction_text = await self.extraction_chain.ainvoke({
-                "message": message,
-                "procurement_amount_options": ', '.join([e.value for e in ProcurementAmount]),
-                "existing_arrangement_options": ', '.join([e.value for e in ExistingArrangement]),
-                "procurement_category_options": ', '.join([e.value for e in ProcurementCategory]),
-                "work_complexity_options": ', '.join([e.value for e in WorkComplexity])
+            extraction_result = await self.extraction_chain.ainvoke({
+                "options": options_text,
+                "input": user_input
             })
         except Exception as e:
-            logging.error(f"Error invoking extraction chain: {e}")
-            return {}
-
-        try:
-            parsed_json = json.loads(extraction_text)
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to parse LLM output as JSON. Raw response:\n{extraction_text}")
-            logging.error(f"JSONDecodeError: {e}")
-            return {}
-
-        if not isinstance(parsed_json, dict):
-            logging.error(f"LLM extraction output is not a JSON object:\n{parsed_json}")
-            return {}
-
-        return parsed_json
-
-    def _normalize_slot_value(self, slot_name: str, user_value: str) -> Optional[str]:
-        """
-        Return the *canonical* slot value if there's a partial or exact match,
-        or None if no match is found.
-        
-        For the PO reference slot, require that the input starts with 'PO'
-        followed by digits. Otherwise, return None.
-        """
-        slot = self.slots.get(slot_name)
-        if not slot:
+            logging.error(f"Error in extraction chain: {e}")
             return None
 
-        if slot_name == "po_reference":
-            # Validate using a regex, e.g., expecting something like "PO123" or "PO 123"
-            if not re.search(r'\bPO\s*\d+', user_value, re.IGNORECASE):
-                return None
+        extracted_option = extraction_result.strip()
+        if extracted_option.lower() == "none":
+            return None
 
-        # If the slot has no validation list, just return the stripped value.
-        if not slot.validation:
-            return user_value.strip()
-
-        user_value_lower = user_value.strip().lower()
-
-        # Check partial or exact match against the valid options
-        for valid_option in slot.validation:
-            if (user_value_lower in valid_option.lower()) or (valid_option.lower() in user_value_lower):
-                return valid_option
-
+        for option in node.options:
+            if option.option.lower() == extracted_option.lower():
+                return option
         return None
 
-    def _get_next_slot(self, user_id: str) -> Optional[str]:
-        """Return the next missing slot name, or None if all are filled."""
-        session_data = self.sessions[user_id]["data"]
-        for slot_name in self.slots:
-            if slot_name not in session_data:
-                return slot_name
-        return None
+    async def _match_option(self, user_input: str, node: DecisionNode) -> Optional[DecisionOption]:
+        # First try direct matching (exact or substring matching)
+        user_input_lower = user_input.strip().lower()
+        for option in node.options:
+            if option.option.lower() == user_input_lower:
+                return option
+        for option in node.options:
+            if option.option.lower() in user_input_lower:
+                return option
+        # Fallback: use the AI extraction chain
+        return await self._extract_option_with_ai(user_input, node)
 
+    # -----------------------
+    # Process a user message with greeting and farewell handling
+    # -----------------------
     async def process_message(self, user_id: str, message: str) -> str:
-        """Main conversation logic to handle a single user message."""
-        # Check for greeting messages
-        greetings = {
-            "hi", "hello", "hallo", "hey", "greetings",
-            "howdy", "good morning", "good afternoon", "good evening"
-        }
-        if message.strip().lower() in greetings:
-            if user_id not in self.sessions:
-                self.sessions[user_id] = {"data": {}, "history": []}
-            greeting_response = (
-                "Hello! How can I assist you with your procurement today? "
-                "Please provide the PO reference number to begin."
-            )
-            self.sessions[user_id]["history"].append(f"System: {greeting_response}")
-            return greeting_response
-
-        # Check if a final result already exists for this user.
-        # If so, and if the user repeats the initial prompt, immediately return the stored answer.
-        if user_id in self.final_results:
-            if message.strip().lower().startswith("hey i want to buy a pen"):
-                prev_data = self.final_results[user_id]['data']
-                final_analysis = self.final_results[user_id]['final_analysis']
-                confirmation_message = "You've already provided the following selections:\n"
-                for key, value in prev_data.items():
-                    confirmation_message += f" - {key}: {value}\n"
-                confirmation_message += "\nFinal Analysis and Recommendations:\n" + final_analysis
-                return confirmation_message
-
-        # Initialize session if it doesn't exist
-        if user_id not in self.sessions:
-            self.sessions[user_id] = {"data": {}, "history": []}
-
-        session = self.sessions[user_id]
+        # Initialize session with conversation history if not already present.
+        session = self.sessions.setdefault(user_id, {"current_node": "existing_arrangement", "answers": {}, "history": []})
         session["history"].append(f"User: {message}")
+        message_lower = message.strip().lower()
 
-        # 1) Try extracting slot values from free-form text
-        extracted_slots = await self._extract_from_message(message)
-        if extracted_slots:
-            for key, val in extracted_slots.items():
-                if key in self.slots:
-                    if key not in session["data"]:
-                        normalized_val = self._normalize_slot_value(key, val)
-                        if normalized_val is not None:
-                            session["data"][key] = normalized_val
+        # Greeting handling
+        greetings = {"hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening"}
+        if message_lower in greetings:
+            current_node = self.decision_tree[session["current_node"]]
+            options_text = ", ".join([opt.option for opt in current_node.options])
+            response = f"Hello! {current_node.question}\nOptions: {options_text}"
+            session["history"].append(f"System: {response}")
+            return response
 
-        # 2) Identify the next missing slot
-        next_slot = self._get_next_slot(user_id)
-        if next_slot:
-            slot_obj = self.slots[next_slot]
+        # Farewell handling
+        farewells = {"bye", "goodbye", "see you", "farewell"}
+        if message_lower in farewells:
+            response = "Goodbye! Thank you for using the procurement assistant. Have a great day!"
+            session["history"].append(f"System: {response}")
+            # Optionally, reset the session upon farewell.
+            self.sessions[user_id] = {"current_node": "existing_arrangement", "answers": {}, "history": []}
+            return response
 
-            # If the next slot is a yes/no question:
-            if set(slot_obj.validation) == {"Yes", "No"}:
-                user_val_lower = message.strip().lower()
-                if user_val_lower in ["yes", "no"]:
-                    session["data"][next_slot] = user_val_lower.capitalize()
-                    next_slot = self._get_next_slot(user_id)
-                    if not next_slot:
-                        return await self._run_analysis_and_store_result(user_id)
+        # Process the input for the current decision node
+        current_node = self.decision_tree[session["current_node"]]
+        matched_option = await self._match_option(message, current_node)
+        if not matched_option:
+            options_text = ", ".join([opt.option for opt in current_node.options])
+            response = f"Invalid response. Please choose one of the following options: {options_text}"
+            session["history"].append(f"System: {response}")
+            return response
 
-                    prompt = self.slots[next_slot].prompt
-                    session["history"].append(f"System: {prompt}")
-                    return prompt
+        # Record the answer
+        session["answers"][current_node.name] = matched_option.option
 
-            normalized_val = self._normalize_slot_value(next_slot, message)
-            if normalized_val is not None:
-                session["data"][next_slot] = normalized_val
-                next_slot = self._get_next_slot(user_id)
-                if not next_slot:
-                    return await self._run_analysis_and_store_result(user_id)
-                
-                prompt = self.slots[next_slot].prompt
-                session["history"].append(f"System: {prompt}")
-                return prompt
-
-        # 3) If all slots are filled, run the analysis
-        next_slot = self._get_next_slot(user_id)
-        if not next_slot:
-            return await self._run_analysis_and_store_result(user_id)
+        if matched_option.answer:
+            # Terminal node reached: provide answer and a summary of selections.
+            summary = "You have selected:\n" + "\n".join([f"{k}: {v}" for k, v in session["answers"].items()])
+            response = f"{matched_option.answer}\n\n{summary}"
+            session["history"].append(f"System: {response}")
+            # Reset the session after completion.
+            self.sessions[user_id] = {"current_node": "existing_arrangement", "answers": {}, "history": session["history"]}
+            return response
+        elif matched_option.next_node:
+            # Move to the next node and ask its question.
+            session["current_node"] = matched_option.next_node
+            next_node = self.decision_tree[matched_option.next_node]
+            options_text = ", ".join([opt.option for opt in next_node.options])
+            response = f"{next_node.question}\nOptions: {options_text}"
+            session["history"].append(f"System: {response}")
+            return response
         else:
-            prompt = self.slots[next_slot].prompt
-            session["history"].append(f"System: {prompt}")
-            return prompt
-
-    async def _run_analysis_and_store_result(self, user_id: str) -> str:
-        """Once all slots are filled, run final analysis & recommendation, store the result, and clear the session."""
-        session = self.sessions[user_id]
-        try:
-            data_for_analysis = {
-                "po_reference": session["data"].get("po_reference", "N/A"),
-                "service_standard": session["data"].get("service_standard", "N/A"),
-                "over_the_counter": session["data"].get("over_the_counter", "N/A"),
-                "procurement_amount": session["data"].get("procurement_amount", "N/A"),
-                "existing_arrangement": session["data"].get("existing_arrangement", "N/A"),
-                "procurement_category": session["data"].get("procurement_category", "N/A"),
-                "work_complexity": session["data"].get("work_complexity", "N/A"),
-                "chat_history": "\n".join(session["history"])
-            }
-
-            final_result = await self.full_chain.ainvoke(data_for_analysis)
-            session["history"].append(f"System: {final_result}")
-
-            # Store the final analysis and the data used so it can be referenced later
-            self.final_results[user_id] = {
-                "data": session["data"].copy(),
-                "final_analysis": final_result
-            }
-            # Optionally clear the session (or keep it if you prefer)
-            self.sessions[user_id] = {"data": {}, "history": []}
-            return final_result
-        except Exception as e:
-            return f"Error generating final analysis: {str(e)}"
+            response = "Workflow configuration error: Option does not have an answer or a next node."
+            session["history"].append(f"System: {response}")
+            return response

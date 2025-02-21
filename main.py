@@ -1,3 +1,4 @@
+# main.py
 from fastapi import FastAPI, HTTPException, Header
 from openai import OpenAI
 from pydantic import BaseModel
@@ -9,6 +10,7 @@ settings = Config()
 
 app = FastAPI()
 openai = OpenAI(api_key=settings.OPENAI_API_KEY)
+
 class ChatRequest(BaseModel):
     user_id: str
     message: str
@@ -27,12 +29,13 @@ app.add_middleware(
 async def chat(request: ChatRequest, assistant_id: str = Header(...)):
     response_text = await workflow.process_message(request.user_id, request.message)
     session_info = workflow.sessions.get(request.user_id, {})
-    completed_slots = session_info.get("data", {})
+    completed_answers = session_info.get("answers", {})
     conversation_history = session_info.get("history", [])
-
+    current_node = session_info.get("current_node", "existing_arrangement")
     return {
         "response": response_text,
-        "completed_slots": completed_slots,
+        "completed_answers": completed_answers,
+        "current_node": current_node,
         "conversation_history": conversation_history
     }
 
