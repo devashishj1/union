@@ -97,7 +97,7 @@ You are an intelligent procurement assistant. Your task is to extract from a fre
 
 1. existing_arrangement: "Does an existing arrangement exist for this contract?"  
    Options: "RoPS", "Preferred Supplier Arrangement (PSA) Name and Number", "Other Council Arrangement", "Local Buy", "No".  
-   Note: If the user says things like "I don't have an agreement", "I have no contract", or "no existing", interpret it as "No".
+   Note: If the user says things like "I don't have an agreement", "I have no contract", or "no existing", and which ever implies "No" interpret it as "No".
 
 2. procurement_value: "What is the value of the procurement?"  
    Options: "Under $10,000", "$10,000-$15,000", "$15,000-$200,000", "Over $200,000".  
@@ -370,7 +370,9 @@ If no option seems relevant, return "None".
 
         greetings = {"hi", "hello", "hey", "greetings", "good morning", "good afternoon", "good evening"}
         if message_lower in greetings:
-            response = "Hey good morning! How can I help you with your procurement today?"
+            first_node = self.decision_tree[session["current_node"]]
+            options_text = ", ".join([opt.option for opt in first_node.options])
+            response = f"Hi! {first_node.question}\nOptions: {options_text}"
             session["history"].append(f"System: {response}")
             return response
 
