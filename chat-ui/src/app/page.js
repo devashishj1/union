@@ -60,11 +60,46 @@ const Home = () => {
       });
 
       const data = await response.json();
-      console.log(data);
+      let content = data.response;
+
+      try {
+        // Parse the response as JSON
+        const parsed = JSON.parse(content);
+        console.log(parsed);
+        
+        content = (
+          <div className="space-y-6">
+            {/* Final Answer */}
+            <div className="p-4 border rounded-md bg-gray-50">
+              <p>{parsed?.analysis?.final_answer || "Not provided"}</p>
+            </div>
+
+            {/* Analysis Details Accordion */}
+            <details className="border rounded-md p-4">
+              <summary className="cursor-pointer font-medium">Show Analysis Details</summary>
+              <div className="mt-4">
+                <h3 className="font-semibold">Risk Assessment</h3>
+                <p>{parsed.analysis?.analysis?.risk_assessment || "N/A"}</p>
+              </div>
+              <div className="mt-4">
+                <h3 className="font-semibold">Documentation & Approvals</h3>
+                <p>{parsed.analysis?.analysis?.documentation_and_approvals || "N/A"}</p>
+              </div>
+              <div className="mt-4">
+                <h3 className="font-semibold">Procurement Strategy</h3>
+                <p>{parsed.analysis?.analysis?.procurement_strategy || "N/A"}</p>
+              </div>
+            </details>
+          </div>
+        );
+      } catch (error) {
+        // If not valid JSON, show as plain text.
+        content = <p>{content}</p>;
+      }
       
       setConversations(prev => [...prev, {
         role: 'assistant',
-        content: data.response
+        content: content
       }]);
     } catch (error) {
       console.error('Error sending message:', error);
